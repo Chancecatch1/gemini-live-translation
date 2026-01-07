@@ -14,14 +14,22 @@ load_dotenv()
 
 INPUT_SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
-CHUNK_DURATION_SEC = 10  # Increased to 10 seconds
-SESSION_TIMEOUT = 840  # 14 minutes (reconnect before 15-min limit)
+CHUNK_DURATION_SEC = 10  # Chunk time in seconds
+MIN_CHUNK_LENGTH = 20   # Skip chunks shorter than this
+SESSION_TIMEOUT = 840   # 14 minutes (reconnect before 15-min limit)
 LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 TRANSLATE_MODEL = "gemini-2.5-flash-lite"
 HISTORY_DIR = "history"
 
+# Supported languages
+LANGUAGES = {
+    "en": {"name": "English", "instruction": "Transcribe ONLY English speech. Ignore any non-English audio completely."},
+    "ja": {"name": "Japanese", "instruction": "日本語の音声のみを書き起こしてください。日本語以外の音声は完全に無視してください。"},
+    "ko": {"name": "Korean", "instruction": "한국어 음성만 받아 적으세요. 한국어가 아닌 음성은 무시하세요."},
+}
+
 # Sentence ending detection
-SENTENCE_ENDERS = {'.', '!', '?'}
+SENTENCE_ENDERS = {'.', '!', '?', '。', '！', '？'}
 
 
 def list_input_devices():
@@ -36,7 +44,7 @@ def list_input_devices():
 
 
 def select_device(devices):
-    print("\nINPUT:")
+    print("\nAudio Input:")
     for idx, (dev_id, name) in enumerate(devices):
         print(f"  [{idx}] {name}")
     while True:
@@ -46,6 +54,23 @@ def select_device(devices):
             if 0 <= choice < len(devices):
                 print(f"- {devices[choice][1]}")
                 return devices[choice][0]
+        except (ValueError, KeyboardInterrupt):
+            pass
+
+
+def select_language():
+    print("\nSource Language:")
+    lang_list = list(LANGUAGES.keys())
+    for idx, lang_code in enumerate(lang_list):
+        print(f"  [{idx}] {LANGUAGES[lang_code]['name']}")
+    while True:
+        try:
+            choice = input(f"Select [0-{len(lang_list)-1}]: ").strip()
+            choice = 0 if choice == "" else int(choice)
+            if 0 <= choice < len(lang_list):
+                selected = lang_list[choice]
+                print(f"- {LANGUAGES[selected]['name']}")
+                return selected
         except (ValueError, KeyboardInterrupt):
             pass
 
@@ -80,7 +105,7 @@ class TranslatorSession:
             return True
         return False
     
-    def get_context(self, n=5):
+    def get_context(self, n=3):
         """Get last n pairs for translation context"""
         return self.pairs[-n:] if self.pairs else []
 
@@ -88,28 +113,55 @@ class TranslatorSession:
 def is_korean(text: str) -> bool:
     """Check if text contains mostly Korean characters"""
     korean_count = sum(1 for c in text if '\uac00' <= c <= '\ud7af' or '\u1100' <= c <= '\u11ff')
-    # Consider Korean if more than 30% of non-space characters are Korean
     non_space = len(text.replace(" ", ""))
     return non_space > 0 and (korean_count / non_space) > 0.3
 
 
-async def translate_text(client, source_text: str, context: list) -> str:
-    """Translate text bidirectionally: Korean→English, others→Korean"""
+def is_japanese(text: str) -> bool:
+    """Check if text contains Japanese characters (hiragana, katakana, kanji)"""
+    jp_count = sum(1 for c in text if 
+        '\u3040' <= c <= '\u309f' or  # Hiragana
+        '\u30a0' <= c <= '\u30ff' or  # Katakana
+        '\u4e00' <= c <= '\u9fff')    # CJK (Kanji)
+    non_space = len(text.replace(" ", ""))
+    return non_space > 0 and (jp_count / non_space) > 0.3
+
+
+def is_valid_transcription(text: str, source_lang: str) -> bool:
+    """Check if transcription matches expected language"""
+    # Skip noise markers
+    if text.strip() in ['<noise>', '<sound>', '']:
+        return False
+    
+    if source_lang == "ja":
+        return is_japanese(text)
+    elif source_lang == "ko":
+        return is_korean(text)
+    elif source_lang == "en":
+        # English: mostly ASCII letters
+        ascii_count = sum(1 for c in text if c.isascii() and c.isalpha())
+        non_space = len(text.replace(" ", ""))
+        return non_space > 0 and (ascii_count / non_space) > 0.5
+    return True
+
+
+async def translate_text(client, source_text: str, source_lang: str, context: list) -> str:
+    """Translate text: en/jp→ko, ko→en/jp"""
     try:
         context_str = ""
         if context:
             context_str = "\n".join([f"- {p['input']} -> {p['output']}" for p in context])
             context_str = f"Previous translations for context:\n{context_str}\n\n"
         
-        # Detect language and set target
-        if is_korean(source_text):
+        # Set target language based on source
+        if source_lang == "ko":
             target_lang = "English"
-            source_lang = "Korean"
+            source_name = "Korean"
         else:
             target_lang = "Korean"
-            source_lang = "the source language"
+            source_name = LANGUAGES[source_lang]["name"]
         
-        prompt = f"""{context_str}This is real-time speech transcription. Translate the following from {source_lang} to natural {target_lang}.
+        prompt = f"""{context_str}This is real-time speech transcription. Translate the following from {source_name} to natural {target_lang}.
 Consider the context above for consistent terminology and natural flow.
 Output ONLY the {target_lang} translation, nothing else.
 
@@ -124,7 +176,7 @@ Output ONLY the {target_lang} translation, nothing else.
         return f"[Translation error: {e}]"
 
 
-async def run_session(input_id: int, session: TranslatorSession, client: genai.Client):
+async def run_session(input_id: int, source_lang: str, session: TranslatorSession, client: genai.Client):
     """Run a single Live API session (max 14 minutes)"""
     audio = pyaudio.PyAudio()
     stream = audio.open(
@@ -136,9 +188,12 @@ async def run_session(input_id: int, session: TranslatorSession, client: genai.C
     translation_queue = asyncio.Queue()
     running = True
     
+    # Use language-specific instruction for STT
+    lang_instruction = LANGUAGES[source_lang]["instruction"]
+    
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction="Listen and transcribe English speech. Do not respond, just listen.",
+        system_instruction=f"{lang_instruction} Do not respond, just listen and transcribe.",
         input_audio_transcription=types.AudioTranscriptionConfig(),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
@@ -173,17 +228,22 @@ async def run_session(input_id: int, session: TranslatorSession, client: genai.C
                 break
     
     async def translator():
-        """Background task that translates queued English text"""
+        """Background task that translates queued text"""
         nonlocal running
         while running:
             try:
-                english_text = await asyncio.wait_for(translation_queue.get(), timeout=0.1)
-                korean_text = await translate_text(client, english_text, session.get_context())
+                source_text = await asyncio.wait_for(translation_queue.get(), timeout=0.1)
+                
+                # Skip too-short chunks (often produce bad translations)
+                if len(source_text.strip()) < MIN_CHUNK_LENGTH:
+                    continue
+                
+                translated = await translate_text(client, source_text, source_lang, session.get_context())
                 
                 # Show translation below the streamed input
-                print(f"{korean_text}\n")
+                print(f"{translated}\n")
                 
-                session.add_pair(english_text, korean_text)
+                session.add_pair(source_text, translated)
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -274,16 +334,23 @@ async def run_session(input_id: int, session: TranslatorSession, client: genai.C
         audio.terminate()
 
 
-async def run_translator(input_id: int):
+async def run_translator(input_id: int, source_lang: str):
     """Run translator with auto-reconnect for 15-min limit"""
     session = TranslatorSession()
     client = genai.Client()
+    
+    # Show translation direction
+    if source_lang == "ko":
+        direction = "Korean → English"
+    else:
+        direction = f"{LANGUAGES[source_lang]['name']} → Korean"
+    print(f"\nTranslation: {direction}")
     
     try:
         while True:
             try:
                 await asyncio.wait_for(
-                    run_session(input_id, session, client),
+                    run_session(input_id, source_lang, session, client),
                     timeout=SESSION_TIMEOUT
                 )
                 break  # Normal exit
@@ -303,11 +370,12 @@ async def main():
         print("No input devices")
         sys.exit(1)
     
-    print("Hybrid Translator")
-    print("=" * 50)
+    print("Live Translator")
+    print("=" * 40)
     
     input_id = select_device(devices)
-    await run_translator(input_id)
+    source_lang = select_language()
+    await run_translator(input_id, source_lang)
 
 
 if __name__ == "__main__":

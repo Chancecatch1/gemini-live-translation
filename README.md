@@ -1,9 +1,14 @@
 # Live Translator
 
-Real-time bidirectional speech translator using Gemini 2.5 Live API.
+Real-time speech translator using Gemini 2.5 Live API.
 
-- **Korean** → English
-- **Other languages** → Korean
+## Translation
+
+| Source | Target |
+|--------|--------|
+| English | → Korean |
+| Japanese | → Korean |
+| Korean | → English |
 
 ## Setup
 
@@ -22,11 +27,15 @@ GOOGLE_API_KEY=your_key_here
 python translator.py
 ```
 
+1. Select audio input device
+2. Select source language
+3. Speak or play audio
+
 ## Features
 
-- Real-time streaming transcription
-- Context-aware translation (uses last 5 translations)
-- Session history saved as JSONL
+- Real-time STT streaming (Gemini Live API)
+- Context-aware translation (last 3 pairs)
+- Saving session history
 
 ## Requirements
 
