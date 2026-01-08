@@ -34,8 +34,9 @@ python translator.py
 ## Features
 
 - Real-time STT streaming (Gemini Live API)
-- Context-aware translation (last 3 pairs)
-- Saving session history
+- Context-aware translation (last 5 pairs)
+- Language filtering (filters non-source-language text)
+- Session history saved as JSONL
 
 ## Requirements
 

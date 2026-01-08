@@ -12,11 +12,17 @@ from google.genai import types
 
 load_dotenv()
 
+# Audio configuration
 INPUT_SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
-CHUNK_DURATION_SEC = 10  # Chunk time in seconds
-MIN_CHUNK_LENGTH = 20   # Skip chunks shorter than this
-SESSION_TIMEOUT = 840   # 14 minutes (reconnect before 15-min limit)
+
+# Translation settings
+CHUNK_DURATION_SEC = 10       # Time buffer before translation
+MIN_CHUNK_LENGTH = 10         # Skip short chunks
+SENTENCE_FLUSH_MIN = 1.0      # Min wait before sentence-end flush
+SESSION_TIMEOUT = 840         # Auto-reconnect at 14 min
+
+# Models
 LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 TRANSLATE_MODEL = "gemini-2.5-flash-lite"
 HISTORY_DIR = "history"
@@ -28,7 +34,7 @@ LANGUAGES = {
     "ko": {"name": "Korean", "instruction": "한국어 음성만 받아 적으세요. 한국어가 아닌 음성은 무시하세요."},
 }
 
-# Sentence ending detection
+# Sentence ending punctuation
 SENTENCE_ENDERS = {'.', '!', '?', '。', '！', '？'}
 
 
@@ -200,13 +206,14 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                 disabled=False,
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=50,
+                prefix_padding_ms=200,
                 silence_duration_ms=100,
             )
         ),
     )
     
     async def capture():
+        """Capture audio from microphone and send to queue"""
         nonlocal running
         while running:
             try:
@@ -238,7 +245,11 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                 if len(source_text.strip()) < MIN_CHUNK_LENGTH:
                     continue
                 
-                translated = await translate_text(client, source_text, source_lang, session.get_context())
+                # Skip if text doesn't match source language (filter noise/other languages)
+                if not is_valid_transcription(source_text, source_lang):
+                    continue
+                
+                translated = await translate_text(client, source_text, source_lang, session.get_context(n=5))
                 
                 # Show translation below the streamed input
                 print(f"{translated}\n")
@@ -276,8 +287,11 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                     # Stream input transcription in real-time
                     if sc.input_transcription and sc.input_transcription.text:
                         chunk = sc.input_transcription.text
-                        current_buffer += chunk
-                        print(chunk, end="", flush=True)  # Real-time streaming
+                        # Filter: only add to buffer if source language detected
+                        if is_valid_transcription(chunk, source_lang) or chunk.strip() in ['<noise>', '<sound>', '']:
+                            current_buffer += chunk
+                            print(chunk, end="", flush=True)  # Real-time streaming
+                        # Skip non-source-language chunks silently
                     
                     elapsed = time.time() - last_chunk_time
                     
@@ -289,7 +303,7 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                     if current_buffer.strip():
                         if elapsed >= CHUNK_DURATION_SEC:
                             should_flush = True
-                        elif elapsed >= 3.0 and ends_with_sentence(current_buffer):
+                        elif elapsed >= 1.0 and ends_with_sentence(current_buffer):
                             should_flush = True
                     
                     if should_flush:
