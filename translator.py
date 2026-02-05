@@ -18,7 +18,7 @@ CHUNK_SIZE = 1024
 
 # Translation settings
 CHUNK_DURATION_SEC = 10       # Time buffer before translation
-MIN_CHUNK_LENGTH = 10         # Skip short chunks
+MIN_CHUNK_LENGTH = 5         # Skip short chunks
 SENTENCE_FLUSH_MIN = 1.0      # Min wait before sentence-end flush
 SESSION_TIMEOUT = 840         # Auto-reconnect at 14 min
 
@@ -32,6 +32,7 @@ LANGUAGES = {
     "en": {"name": "English", "instruction": "Transcribe ONLY English speech. Ignore any non-English audio completely."},
     "ja": {"name": "Japanese", "instruction": "日本語の音声のみを書き起こしてください。日本語以外の音声は完全に無視してください。"},
     "ko": {"name": "Korean", "instruction": "한국어 음성만 받아 적으세요. 한국어가 아닌 음성은 무시하세요."},
+    "fr": {"name": "French", "instruction": "Transcrivez UNIQUEMENT le discours en français. Ignorez complètement tout audio non français."},
 }
 
 # Sentence ending punctuation
@@ -133,6 +134,17 @@ def is_japanese(text: str) -> bool:
     return non_space > 0 and (jp_count / non_space) > 0.3
 
 
+def is_french(text: str) -> bool:
+    """Check if text contains French characters (Latin with accents)"""
+    # French-specific accented characters
+    french_chars = set('àâäéèêëïîôùûüçœæÀÂÄÉÈÊËÏÎÔÙÛÜÇŒÆ')
+    french_count = sum(1 for c in text if c in french_chars)
+    ascii_alpha = sum(1 for c in text if c.isascii() and c.isalpha())
+    non_space = len(text.replace(" ", ""))
+    # French: has Latin letters AND either has French accents OR is mostly ASCII
+    return non_space > 0 and (ascii_alpha / non_space) > 0.5 and (french_count > 0 or ascii_alpha > 0)
+
+
 def is_valid_transcription(text: str, source_lang: str) -> bool:
     """Check if transcription matches expected language"""
     # Skip noise markers
@@ -144,10 +156,14 @@ def is_valid_transcription(text: str, source_lang: str) -> bool:
     elif source_lang == "ko":
         return is_korean(text)
     elif source_lang == "en":
-        # English: mostly ASCII letters
+        # English: mostly ASCII letters, no French accents
+        french_chars = set('àâäéèêëïîôùûüçœæÀÂÄÉÈÊËÏÎÔÙÛÜÇŒÆ')
+        has_french = any(c in french_chars for c in text)
         ascii_count = sum(1 for c in text if c.isascii() and c.isalpha())
         non_space = len(text.replace(" ", ""))
-        return non_space > 0 and (ascii_count / non_space) > 0.5
+        return non_space > 0 and (ascii_count / non_space) > 0.5 and not has_french
+    elif source_lang == "fr":
+        return is_french(text)
     return True
 
 
@@ -182,8 +198,8 @@ Output ONLY the {target_lang} translation, nothing else.
         return f"[Translation error: {e}]"
 
 
-async def run_session(input_id: int, source_lang: str, session: TranslatorSession, client: genai.Client):
-    """Run a single Live API session (max 14 minutes)"""
+async def run_session(input_id: int, source_lang: str, session: TranslatorSession, client: genai.Client, resume_handle: str = None):
+    """Run a single Live API session with auto-resume support"""
     audio = pyaudio.PyAudio()
     stream = audio.open(
         format=pyaudio.paInt16, channels=1, rate=INPUT_SAMPLE_RATE,
@@ -193,6 +209,7 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
     queue = asyncio.Queue()
     translation_queue = asyncio.Queue()
     running = True
+    new_resume_handle = None  # Store new handle for reconnection
     
     # Use language-specific instruction for STT
     lang_instruction = LANGUAGES[source_lang]["instruction"]
@@ -209,6 +226,14 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                 prefix_padding_ms=200,
                 silence_duration_ms=100,
             )
+        ),
+        # Enable unlimited session duration with context compression
+        context_window_compression=types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow(),
+        ),
+        # Enable session resumption for reconnection
+        session_resumption=types.SessionResumptionConfig(
+            handle=resume_handle  # Pass previous handle or None for new session
         ),
     )
     
@@ -262,7 +287,7 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
     
     async def receive(session_api):
         """Receive transcription and flush buffer on time OR sentence end"""
-        nonlocal running
+        nonlocal running, new_resume_handle
         current_buffer = ""
         last_chunk_time = time.time()
         
@@ -273,6 +298,16 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                     if not running:
                         break
                     
+                    # Handle session resumption updates
+                    if resp.session_resumption_update:
+                        update = resp.session_resumption_update
+                        if update.resumable and update.new_handle:
+                            new_resume_handle = update.new_handle
+                    
+                    # Handle GoAway message (connection about to close)
+                    if resp.go_away is not None:
+                        print(f"\n[Server closing connection, time left: {resp.go_away.time_left}]")
+                    
                     sc = resp.server_content
                     if sc is None:
                         continue
@@ -280,6 +315,7 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
                     if sc.interrupted:
                         if current_buffer.strip():
                             print()  # New line after interrupted input
+                            await translation_queue.put(current_buffer.strip())  # Translate interrupted speech too
                         current_buffer = ""
                         last_chunk_time = time.time()
                         continue
@@ -315,18 +351,24 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
             except Exception as e:
                 if running:
                     print(f"\n[receive error: {e}]")
+                    # Flush remaining buffer before raising
+                    if current_buffer.strip():
+                        await translation_queue.put(current_buffer.strip())
+                    raise  # Re-raise to trigger reconnection
                 break
         
-        # Flush remaining buffer
+        # Flush remaining buffer (normal exit)
         if current_buffer.strip():
             await translation_queue.put(current_buffer.strip())
     
     capture_task = asyncio.create_task(capture())
     translator_task = asyncio.create_task(translator())
+    session_error = None  # Store error to re-raise after cleanup
     
     try:
         async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session_api:
-            print("Connected!")
+            status = "Resumed" if resume_handle else "Connected"
+            print(f"{status}!")
             send_task = asyncio.create_task(send(session_api))
             await receive(session_api)
             send_task.cancel()
@@ -334,6 +376,7 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
     except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as e:
+        session_error = e  # Store error to re-raise
         print(f"\n[Session error: {e}]")
     finally:
         running = False
@@ -346,12 +389,19 @@ async def run_session(input_id: int, source_lang: str, session: TranslatorSessio
         stream.stop_stream()
         stream.close()
         audio.terminate()
+    
+    # Re-raise exception after cleanup so run_translator can reconnect
+    if session_error:
+        raise session_error
+    
+    return new_resume_handle  # Return handle for next session
 
 
 async def run_translator(input_id: int, source_lang: str):
-    """Run translator with auto-reconnect for 15-min limit"""
+    """Run translator with auto-reconnect using session resumption"""
     session = TranslatorSession()
     client = genai.Client()
+    resume_handle = None  # Store session handle for reconnection
     
     # Show translation direction
     if source_lang == "ko":
@@ -363,16 +413,25 @@ async def run_translator(input_id: int, source_lang: str):
     try:
         while True:
             try:
-                await asyncio.wait_for(
-                    run_session(input_id, source_lang, session, client),
+                new_handle = await asyncio.wait_for(
+                    run_session(input_id, source_lang, session, client, resume_handle),
                     timeout=SESSION_TIMEOUT
                 )
+                # Update handle for next reconnection
+                if new_handle:
+                    resume_handle = new_handle
                 break  # Normal exit
             except asyncio.TimeoutError:
-                print(f"\n[Auto-reconnecting at {SESSION_TIMEOUT}s...]")
+                print(f"\n[Timeout - auto-reconnecting...]")
                 continue
             except KeyboardInterrupt:
                 break
+            except Exception as e:
+                # Handle 1011 and other server errors with auto-reconnect
+                print(f"\n[Connection error: {e}]")
+                print("[Auto-reconnecting in 2 seconds...]")
+                await asyncio.sleep(2)  # Brief delay before reconnecting
+                continue
     finally:
         print(f"\nSession saved: {session.filepath}")
         print(f"[{session.chunk_count} chunks translated]")
