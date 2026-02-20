@@ -1,7 +1,7 @@
 """
 Audio File Transcription Tool
-Transcribes audio files (mp3, wav, m4a) using Gemini API.
-Optimized for bilingual (English + French) lecture transcription.
+Transcribes audio files using Gemini API.
+Supports multilingual transcription (English, Korean, French) - single or mixed.
 
 Usage:
     python transcribe.py path/to/audio.mp3
@@ -20,6 +20,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -113,25 +114,19 @@ async def transcribe_audio(file_path: Path, output_path: Path = None) -> str:
         file_ref = await client.aio.files.upload(file=processed_path)
         print(f"Uploaded: {file_ref.name}")
         
-        # Transcription prompt for bilingual (English + French) content
-        prompt = """Role: You are an expert linguist and professional transcriber specialized in language learning contexts.
-Context: This is a French language course taught primarily in English. The students are beginners and may have non-native accents.
+        # Multilingual transcription prompt - accuracy focused
+        prompt = """You are a professional transcriber. Transcribe the audio with maximum accuracy.
 
 Instructions:
-1. **Language Separation**:
-   - **English**: Transcribe all instructional content, explanations, and chit-chat in English.
-   - **French**: Transcribe all target language examples, drills, and reading in French.
-2. **Accuracy & Correction**:
-   - For French terms: Ensure correct spelling and diacritics (accents).
-   - **Pronunciation Errors**: If a student makes a pronunciation error but the intended word is recognizable, transcribe the **intended correct French word**.
-   - If a word is completely unrecognizable, mark as [unclear].
-3. **Formatting**:
-   - Use Markdown.
-   - Differentiate speakers (e.g., **Instructor:**, **Student:**) if distinguishable.
-   - Use paragraph breaks for logical pauses.
-4. **Tone**: Clean and readable. Remove excessive stuttering or "um/uh" unless it is relevant to a specific pronunciation correction.
+- Detect and transcribe all languages spoken (English, Korean, French).
+- Use native scripts: Korean in Hangul (proper 띄어쓰기), French with diacritics (é, è, ç).
+- Handle non-native accents - infer intended words from context.
+- Spell technical/academic terms correctly.
+- If a word is genuinely unclear, mark [unclear].
+- Remove excessive filler words (um, uh, 어, 음).
+- Separate speakers if distinguishable.
 
-Output: A clean, well-formatted Markdown transcript."""
+Output the transcript in clean, readable Markdown."""
 
         print("Generating transcript...")
         response = await client.aio.models.generate_content(
@@ -139,7 +134,10 @@ Output: A clean, well-formatted Markdown transcript."""
             contents=[
                 file_ref,
                 prompt
-            ]
+            ],
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level="low")
+            )
         )
         
         transcript = response.text

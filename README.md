@@ -1,6 +1,6 @@
 # Live Translator
 
-Real-time speech translator using Gemini 2.5 Live API.
+Real-time speech translator using Gemini 2.5 Flash Live API.
 
 ## Translation
 
@@ -8,6 +8,7 @@ Real-time speech translator using Gemini 2.5 Live API.
 |--------|--------|
 | English | → Korean |
 | Japanese | → Korean |
+| French | → Korean |
 | Korean | → English |
 
 ## Setup
@@ -37,8 +38,8 @@ python translator.py
 ```bash
 python transcribe.py lecture.mp3
 ```
-- Supports: mp3, wav, m4a, flac, etc.
-- Optimized for **Bilingual (English/French)** lectures.
+- Supports: mp3, wav, m4a, flac, ogg, webm
+- Multilingual: **English, Korean, French** (single or mixed)
 
 ## Requirements
 
